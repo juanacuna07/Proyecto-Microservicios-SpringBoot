@@ -1,0 +1,207 @@
+# =====================================================================================
+#  PROYECTO 03 - Aplicacion Multicontenedor con Docker Compose
+#  Infraestructura y Seguridad Computacional - Universidad de Ibague
+#  Integrantes: Juan Camilo Acuna, Luis Miguel Hernandez, Stephany Trujillo, Daniel Arteaga
+#
+#  Arquitectura:
+#     Cliente (Postman) -> api-gateway:8080 -> auth-service:8081 -> auth-db (PostgreSQL)
+#                                           -> user-service:8082 -> users-db (PostgreSQL)
+#     key-generator: genera el par de llaves RSA que firman/validan los JWT
+#
+#  Estructura del archivo:
+#     1) SERVICIOS   (services)      6 contenedores
+#     2) ENLACES     (depends_on / links / variables con el nombre del servicio)
+#     3) VOLUMENES   (volumes)       4 volumenes con nombre
+#     4) PUERTOS     (ports)         8080, 8081, 8082, 5433, 5434
+#     5) REDES       (networks)      frontend-net y backend-net
+# =====================================================================================
+
+name: proyecto03-microservicios
+
+# -------------------------------------------------------------------------------------
+# 1) SERVICIOS
+# -------------------------------------------------------------------------------------
+services:
+
+  # ---------------------------------------------------------------- Base de datos auth
+  auth-db:
+    image: postgres:17-alpine
+    container_name: p03-auth-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: auth_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${AUTH_DB_PASSWORD:-postgres_auth_local}
+    # 3) VOLUMEN: los datos de PostgreSQL sobreviven aunque se elimine el contenedor
+    volumes:
+      - auth-data:/var/lib/postgresql/data
+    # 4) PUERTO: host 5433 -> contenedor 5432 (para consultar con psql/DBeaver)
+    ports:
+      - "5433:5432"
+    # 5) RED: solo red interna de datos
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------- Base de datos users
+  users-db:
+    image: postgres:17-alpine
+    container_name: p03-users-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: users_db
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${USERS_DB_PASSWORD:-postgres_users_local}
+    volumes:
+      - users-data:/var/lib/postgresql/data
+    ports:
+      - "5434:5432"
+    networks:
+      - backend-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ------------------------------------------- Procesamiento: generador de llaves RSA
+  # Se ejecuta una vez, crea el par de llaves (si no existe) y termina.
+  # La llave privada va a un volumen que SOLO monta auth-service.
+  # La llave publica va a otro volumen que montan auth-service y user-service.
+  key-generator:
+    image: alpine:3.20
+    container_name: p03-key-generator
+    restart: "no"
+    volumes:
+      - jwt-private:/keys/private
+      - jwt-public:/keys/public
+    networks:
+      - backend-net
+    command:
+      - sh
+      - -c
+      - |
+        if [ -f /keys/private/private.pem ] && [ -f /keys/public/public.pem ]; then
+          echo "Llaves RSA existentes: se reutilizan"
+        else
+          command -v openssl >/dev/null 2>&1 || apk add --no-cache openssl >/dev/null
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out /keys/private/private.pem
+          openssl pkey -in /keys/private/private.pem -pubout -out /keys/public/public.pem
+          echo "Par de llaves RSA generado"
+        fi
+        chown 1001:1001 /keys/private/private.pem && chmod 400 /keys/private/private.pem
+        chmod 444 /keys/public/public.pem
+
+  # ------------------------------------------------------------------- auth-service
+  auth-service:
+    build:
+      context: .
+      dockerfile: auth-service/Dockerfile
+    # Nombre de la imagen que se publica en Docker Hub
+    image: ${DOCKERHUB_USER:-local}/p03-auth-service:${IMAGE_TAG:-2.0.0}
+    container_name: p03-auth-service
+    restart: unless-stopped
+    environment:
+      # 2) ENLACE: se conecta a la base usando el NOMBRE DEL SERVICIO (auth-db) como host
+      AUTH_DB_URL: jdbc:postgresql://auth-db:5432/auth_db
+      AUTH_DB_USER: ${POSTGRES_USER:-postgres}
+      AUTH_DB_PASSWORD: ${AUTH_DB_PASSWORD:-postgres_auth_local}
+      JWT_ISSUER: ${JWT_ISSUER:-taller-02-auth-service}
+      JWT_EXPIRATION_MINUTES: ${JWT_EXPIRATION_MINUTES:-60}
+      JWT_PRIVATE_KEY_PATH: /keys/private/private.pem
+      JWT_PUBLIC_KEY_PATH: /keys/public/public.pem
+      DEMO_DATA_ENABLED: ${DEMO_DATA_ENABLED:-true}
+    # 2) ENLACES / dependencias: arranca cuando la BD este sana y las llaves existan
+    depends_on:
+      auth-db:
+        condition: service_healthy
+      key-generator:
+        condition: service_completed_successfully
+    links:
+      - auth-db
+    volumes:
+      - jwt-private:/keys/private:ro
+      - jwt-public:/keys/public:ro
+    ports:
+      - "8081:8081"   # Swagger: http://localhost:8081/swagger-ui.html
+    networks:
+      - frontend-net
+      - backend-net
+
+  # ------------------------------------------------------------------- user-service
+  user-service:
+    build:
+      context: .
+      dockerfile: user-service/Dockerfile
+    image: ${DOCKERHUB_USER:-local}/p03-user-service:${IMAGE_TAG:-2.0.0}
+    container_name: p03-user-service
+    restart: unless-stopped
+    environment:
+      USERS_DB_URL: jdbc:postgresql://users-db:5432/users_db
+      USERS_DB_USER: ${POSTGRES_USER:-postgres}
+      USERS_DB_PASSWORD: ${USERS_DB_PASSWORD:-postgres_users_local}
+      JWT_ISSUER: ${JWT_ISSUER:-taller-02-auth-service}
+      JWT_PUBLIC_KEY_PATH: /keys/public/public.pem
+    depends_on:
+      users-db:
+        condition: service_healthy
+      key-generator:
+        condition: service_completed_successfully
+    links:
+      - users-db
+    # Solo la llave PUBLICA: este servicio valida tokens pero no puede firmarlos
+    volumes:
+      - jwt-public:/keys/public:ro
+    ports:
+      - "8082:8082"   # Swagger: http://localhost:8082/swagger-ui.html
+    networks:
+      - frontend-net
+      - backend-net
+
+  # -------------------------------------------------------------------- api-gateway
+  api-gateway:
+    build:
+      context: .
+      dockerfile: api-gateway/Dockerfile
+    image: ${DOCKERHUB_USER:-local}/p03-api-gateway:${IMAGE_TAG:-2.0.0}
+    container_name: p03-api-gateway
+    restart: unless-stopped
+    environment:
+      # 2) ENLACES: el gateway enruta hacia los servicios por su nombre DNS interno
+      AUTH_SERVICE_URL: http://auth-service:8081
+      USER_SERVICE_URL: http://user-service:8082
+    depends_on:
+      - auth-service
+      - user-service
+    links:
+      - auth-service
+      - user-service
+    ports:
+      - "8080:8080"   # Punto de entrada unico: http://localhost:8080
+    networks:
+      - frontend-net
+
+# -------------------------------------------------------------------------------------
+# 3) VOLUMENES con nombre (persistencia)
+#    Eliminar un contenedor NO elimina su volumen. Solo "docker compose down -v" los borra.
+# -------------------------------------------------------------------------------------
+volumes:
+  auth-data:      # datos de PostgreSQL de auth_db
+  users-data:     # datos de PostgreSQL de users_db
+  jwt-private:    # llave privada RSA (solo auth-service)
+  jwt-public:     # llave publica RSA (auth-service y user-service)
+
+# -------------------------------------------------------------------------------------
+# 5) REDES
+#    frontend-net: gateway <-> microservicios
+#    backend-net : microservicios <-> bases de datos (el gateway NO tiene acceso a las BD)
+# -------------------------------------------------------------------------------------
+networks:
+  frontend-net:
+    driver: bridge
+  backend-net:
+    driver: bridge

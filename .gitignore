@@ -1,0 +1,18 @@
+# Compilacion
+**/target/
+*.class
+
+# IDEs
+.idea/
+.vscode/
+*.iml
+
+# Secretos: nunca subir a Git
+.env
+keys/
+*.pem
+*.key
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
